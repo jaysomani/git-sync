@@ -324,13 +324,17 @@ func NewHTTPConnWithClient(ep *url.URL, label string, auth AuthMethod, httpClien
 		httpClient = &http.Client{Transport: http.DefaultTransport}
 	}
 	normalizeEndpointPath(ep)
-	return &HTTPConn{
+	c := &HTTPConn{
 		Label:          label,
 		EndpointURL:    ep,
-		HTTP:           guardRedirects(httpClient),
 		Auth:           auth,
 		authIsExplicit: auth != nil,
 	}
+	// guardRedirects reads c.FollowInfoRefsRedirect at redirect time, not
+	// here: every caller sets that field on the returned *HTTPConn after
+	// construction, so c must exist first for the closure to see it.
+	c.HTTP = guardRedirects(c, httpClient)
+	return c
 }
 
 // skipsTLSVerify reports whether this connection's TLS verification is off,
@@ -382,8 +386,21 @@ func transportSkipsTLSVerify(rt http.RoundTripper) bool {
 // a redirect loop would spin forever.
 const maxRedirects = 10
 
-// guardRedirects returns a shallow copy of client whose redirect policy strips
-// credentials on a hop that leaves the site of the request that was issued.
+// guardRedirects returns a shallow copy of client whose redirect policy
+// refuses to follow a POST redirect by default and strips credentials on a
+// hop that leaves the site of the request that was issued.
+//
+// Vanilla git's HTTP transport defaults to http.followRedirects=initial: it
+// follows the /info/refs GET redirect to discover the actual host, but a POST
+// (/git-upload-pack, /git-receive-pack) does not follow — the 3xx is surfaced
+// to the caller instead. Go's http.Client follows every redirect regardless
+// of method, so without this gate a POST that 3xx's gets silently followed
+// where git itself would fail, and any Authorization on that POST is subject
+// to the same-site strip below without git-sync ever noticing the hop
+// happened. conn.FollowInfoRefsRedirect is the existing opt-in for this:
+// gating on it here (read live, since every caller sets it on the returned
+// *HTTPConn after construction) means "follow redirects" stays one setting
+// instead of two.
 //
 // The stdlib already refuses to carry Authorization across a redirect, but its
 // notion of "same host" compares hostnames and ignores the port and scheme, so
@@ -404,12 +421,15 @@ const maxRedirects = 10
 // The copy shares the caller's Transport and only differs in redirect policy,
 // so this neither mutates nor reconfigures the client that was passed in. Any
 // CheckRedirect the caller already set still runs, and still gets to veto.
-func guardRedirects(client *http.Client) *http.Client {
+func guardRedirects(conn *HTTPConn, client *http.Client) *http.Client {
 	clone := *client
 	prev := clone.CheckRedirect
 	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+		if req.Method == http.MethodPost && !conn.FollowInfoRefsRedirect {
+			return http.ErrUseLastResponse
 		}
 		if prev != nil {
 			if err := prev(req, via); err != nil {

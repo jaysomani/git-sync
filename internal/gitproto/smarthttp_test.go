@@ -1793,6 +1793,11 @@ func TestGuardRedirectsAnchorsOnTheIssuedRequest(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	conn := NewHTTPConnWithClient(elsewhere, "source", nil, adopted.Client())
+	// Adoption itself is only ever reachable with the flag set (see
+	// resolvedEndpoint's doc comment), so the scenario this test models
+	// requires it explicitly now that a POST redirect needs it to be
+	// followed at all.
+	conn.FollowInfoRefsRedirect = true
 
 	// Aim a request directly at the adopted host, carrying credentials the
 	// helper resolved for it.
@@ -1855,6 +1860,125 @@ func TestGuardRedirectsStripsOnCrossSiteHop(t *testing.T) {
 	defer mu.Unlock()
 	if gotAuth != "" {
 		t.Errorf("credentials followed a cross-site hop: %q", gotAuth)
+	}
+}
+
+// Regression test for #67: vanilla git's http.followRedirects=initial follows
+// the /info/refs GET redirect but never a POST (/git-upload-pack,
+// /git-receive-pack) one, unless the user opts in. Before this, Go's stdlib
+// default followed every redirect regardless of method, so a POST that 3xx'd
+// got silently followed where git itself would surface the 3xx.
+func TestGuardRedirectsRefusesPOSTRedirectByDefault(t *testing.T) {
+	var finalHit bool
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		finalHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/repo.git/git-upload-pack", http.StatusTemporaryRedirect)
+	}))
+	defer start.Close()
+
+	ep, err := url.Parse(start.URL + "/repo.git")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, start.URL+"/repo.git/git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	res, err := conn.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if finalHit {
+		t.Error("POST redirect was followed with FollowInfoRefsRedirect unset")
+	}
+	if res.StatusCode != http.StatusTemporaryRedirect {
+		t.Errorf("status = %d, want the unfollowed 307 surfaced to the caller", res.StatusCode)
+	}
+}
+
+// The counterpart to TestGuardRedirectsRefusesPOSTRedirectByDefault: the same
+// POST redirect must still be followed when the user has opted in, since
+// FollowInfoRefsRedirect is the existing "follow redirects" setting and #67
+// deliberately reuses it rather than adding a second flag.
+func TestGuardRedirectsFollowsPOSTRedirectWithFollowInfoRefsRedirect(t *testing.T) {
+	var finalHit bool
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		finalHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/repo.git/git-upload-pack", http.StatusTemporaryRedirect)
+	}))
+	defer start.Close()
+
+	ep, err := url.Parse(start.URL + "/repo.git")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
+	conn.FollowInfoRefsRedirect = true
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, start.URL+"/repo.git/git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	res, err := conn.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if !finalHit {
+		t.Error("POST redirect was not followed with FollowInfoRefsRedirect set")
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 from the followed redirect", res.StatusCode)
+	}
+}
+
+// A GET (e.g. /info/refs) must keep following by default — only POST changed.
+func TestGuardRedirectsStillFollowsGETRedirectByDefault(t *testing.T) {
+	var finalHit bool
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		finalHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/repo.git/info/refs", http.StatusTemporaryRedirect)
+	}))
+	defer start.Close()
+
+	ep, err := url.Parse(start.URL + "/repo.git")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, start.URL+"/repo.git/info/refs", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	res, err := conn.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if !finalHit {
+		t.Error("GET redirect was not followed by default")
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 from the followed redirect", res.StatusCode)
 	}
 }
 
