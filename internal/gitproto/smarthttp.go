@@ -42,6 +42,19 @@ func httpError(res *http.Response) error {
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
+	// A 3xx here is guardRedirects refusing to follow a POST redirect with
+	// FollowInfoRefsRedirect unset (http.ErrUseLastResponse) — the only way
+	// a redirect status ever reaches this function, since Go's http.Client
+	// otherwise follows every redirect itself before returning. Location
+	// names where the server tried to send the request, and the flag hint
+	// turns "why did my push get a 307" into an actionable answer instead
+	// of a bare status code.
+	if res.StatusCode < http.StatusBadRequest {
+		if location := res.Header.Get("Location"); location != "" {
+			return fmt.Errorf("http %d: server redirected to %s — use --source-follow-info-refs-redirect or --target-follow-info-refs-redirect to follow POST redirects",
+				res.StatusCode, location)
+		}
+	}
 	var reason string
 	if res.Body != nil {
 		limited := io.LimitReader(res.Body, maxHTTPErrorBody+1)
@@ -228,14 +241,28 @@ type HTTPConn struct {
 	// disables the helper fallback — explicit auth wins.
 	CredentialHelper CredentialHelper
 
-	// FollowInfoRefsRedirect, when true, rewrites Endpoint.Scheme and
-	// Endpoint.Host to the final URL returned by RequestInfoRefs after
-	// HTTP redirects. Subsequent PostRPC* calls then target the
-	// redirected host directly, matching vanilla git's smart-HTTP
-	// behaviour for discovery-aware servers that 307 /info/refs to a
-	// hosting replica. Endpoint.Path is never modified — it still
-	// contains the repo path. Off by default to preserve behaviour for
-	// callers that rely on Endpoint being stable.
+	// FollowInfoRefsRedirect controls redirect-following for both halves
+	// of the smart-HTTP exchange, not just the one its name mentions:
+	//
+	//   - /info/refs GET: when true, records the final URL RequestInfoRefs
+	//     landed on in resolvedEndpoint, so subsequent PostRPC* calls
+	//     target the redirected host directly — matching vanilla git's
+	//     smart-HTTP behaviour for discovery-aware servers that redirect
+	//     /info/refs to a hosting replica. EndpointURL itself is never
+	//     mutated; it still contains the repo path and stays available for
+	//     display/logging/telemetry. When false, redirects are still
+	//     followed transparently by the underlying http.Client (only
+	//     PostRPC* redirects are gated — see below), but the endpoint is
+	//     never adopted for later calls.
+	//   - POST (/git-upload-pack, /git-receive-pack): when false (the
+	//     default), a POST redirect is refused — guardRedirects returns
+	//     the 3xx to the caller instead of following it, matching vanilla
+	//     git's http.followRedirects=initial, which only auto-follows the
+	//     GET. When true, POST redirects are followed like GET ones.
+	//
+	// Off by default to preserve behaviour for callers that rely on
+	// EndpointURL being stable and on a POST redirect surfacing rather
+	// than silently following.
 	FollowInfoRefsRedirect bool
 
 	// InsecureSkipTLSVerify mirrors the same-named transport setting and
@@ -428,7 +455,13 @@ func guardRedirects(conn *HTTPConn, client *http.Client) *http.Client {
 		if len(via) >= maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", maxRedirects)
 		}
-		if req.Method == http.MethodPost && !conn.FollowInfoRefsRedirect {
+		// via[0].Method, not req.Method: Go's client rewrites the method
+		// before calling CheckRedirect on a 301/302/303, turning a POST
+		// into a GET for the request about to be sent. via[0] is the
+		// original request that started the chain, so it still says POST
+		// for all five redirect codes; req.Method would only catch
+		// 307/308, which are the only two codes that preserve it.
+		if len(via) > 0 && via[0].Method == http.MethodPost && !conn.FollowInfoRefsRedirect {
 			return http.ErrUseLastResponse
 		}
 		if prev != nil {
@@ -753,21 +786,30 @@ func ApplyAuth(req *http.Request, auth AuthMethod) {
 //     "0000" as body — a valid no-op (zero ref updates, zero pack data)
 //     by spec. We probe with POST rather than GET because the auth layer
 //     may only gate the POST handler; a GET probe would slip past on
-//     servers that 404/405 GET while requiring auth on POST.
+//     servers that 404/405 GET while requiring auth on POST. The probe
+//     itself is subject to guardRedirects like any other POST: with
+//     FollowInfoRefsRedirect unset (the default), a cross-host redirect on
+//     the probe is refused and returned as-is, so step 2 below never sees a
+//     401 in that case — the function falls through to the "doesn't 401"
+//     case and attaches nothing. A cross-host challenge can only be
+//     discovered this way when the flag is set.
 //  2. If the probe gets 401, ask the helper for credentials keyed on the
 //     actually-challenged host (which may differ from c.EndpointURL after a
-//     cross-host redirect). Keying on the post-redirect host matters: that's
-//     where the user stored their creds, and that's the key we'll later
-//     Approve/Reject against.
+//     cross-host redirect, reachable only with FollowInfoRefsRedirect set —
+//     see the note on step 1). Keying on the post-redirect host matters:
+//     that's where the user stored their creds, and that's the key we'll
+//     later Approve/Reject against.
 //  3. Attach the credentials tentatively. The next real operation calls
 //     resolvePendingHelperCreds, which Approves them only once that
 //     operation fully succeeds or Rejects them on 401/403 — helper state
 //     only changes based on the actual outcome, never on the probe response
 //     alone.
-//  4. If the challenge came from a cross-host redirect, rewrite
-//     c.EndpointURL's scheme/host to the challenger so the real op skips the
-//     redirect (which Go's http.Client would otherwise follow with the
-//     Authorization header stripped, turning every push into a fresh 401).
+//  4. If the challenge came from a cross-host redirect, record the
+//     challenger as this conn's resolved endpoint (adoptChallengeHost) so
+//     the real op skips the redirect (which Go's http.Client would
+//     otherwise follow with the Authorization header stripped, turning
+//     every push into a fresh 401). Also gated on FollowInfoRefsRedirect —
+//     see adoptChallengeHost.
 //
 // If the probe doesn't 401 (200, 404, 405, etc.) we don't attach; the
 // server either accepts anonymous POSTs here or returns ambiguously,
@@ -938,11 +980,16 @@ func (c *HTTPConn) tryHelperRetry(ctx context.Context, res *http.Response, retry
 //
 // Gated on FollowInfoRefsRedirect: the user explicitly opting into redirect-
 // following is the trigger for the conn's effective endpoint changing. With
-// the flag off the immediate retry still hits the challenger directly (so
-// the current op succeeds and creds get Approved on the right key), but the
-// next op stays pointed at the user-typed URL. EndpointURL itself is never
-// mutated; we set resolvedEndpoint instead, leaving EndpointURL as user
-// input for display/logging/telemetry to read.
+// the flag off, the immediate GET retry (RequestInfoRefs) still hits the
+// challenger directly — the underlying redirect there was already followed
+// by the time this runs, so the current op succeeds and creds get Approved
+// on the right key — but the next op stays pointed at the user-typed URL.
+// This does NOT hold for POST: with the flag off, a cross-host POST redirect
+// (the EnsureAuthForService probe included) is refused before it ever
+// reaches a 401, so the credential-helper retry this function is part of
+// never runs at all for that case — see guardRedirects. EndpointURL itself
+// is never mutated; we set resolvedEndpoint instead, leaving EndpointURL as
+// user input for display/logging/telemetry to read.
 //
 // Path/userinfo are copied from EndpointURL — same assumption
 // FollowInfoRefsRedirect's /info/refs block makes about the redirect target

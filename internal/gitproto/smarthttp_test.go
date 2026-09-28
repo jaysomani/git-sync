@@ -1863,122 +1863,122 @@ func TestGuardRedirectsStripsOnCrossSiteHop(t *testing.T) {
 	}
 }
 
-// Regression test for #67: vanilla git's http.followRedirects=initial follows
-// the /info/refs GET redirect but never a POST (/git-upload-pack,
-// /git-receive-pack) one, unless the user opts in. Before this, Go's stdlib
-// default followed every redirect regardless of method, so a POST that 3xx'd
-// got silently followed where git itself would surface the 3xx.
-func TestGuardRedirectsRefusesPOSTRedirectByDefault(t *testing.T) {
-	var finalHit bool
-	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		finalHit = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer final.Close()
-	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, final.URL+"/repo.git/git-upload-pack", http.StatusTemporaryRedirect)
-	}))
-	defer start.Close()
+// Regression test for #67 and the 301/302/303 gap flagged in PR #122 review:
+// vanilla git's http.followRedirects=initial follows the /info/refs GET
+// redirect but never a POST (/git-upload-pack, /git-receive-pack) one,
+// unless the user opts in. Table-driven over method x status code x flag,
+// because Go's http.Client rewrites a POST to GET on a 301/302/303 before
+// CheckRedirect ever sees the upcoming request — guardRedirects has to key
+// on via[0].Method (the request that started the chain) rather than
+// req.Method to catch those three codes too; 307/308 are the only two that
+// preserve the method on req itself.
+func TestGuardRedirectsPostBehavior(t *testing.T) {
+	tests := []struct {
+		name           string
+		method         string
+		statusCode     int
+		followFlag     bool
+		expectFollowed bool
+	}{
+		// POST + flag off: none of the five codes are followed.
+		{"POST 301 flag off", http.MethodPost, http.StatusMovedPermanently, false, false},
+		{"POST 302 flag off", http.MethodPost, http.StatusFound, false, false},
+		{"POST 303 flag off", http.MethodPost, http.StatusSeeOther, false, false},
+		{"POST 307 flag off", http.MethodPost, http.StatusTemporaryRedirect, false, false},
+		{"POST 308 flag off", http.MethodPost, http.StatusPermanentRedirect, false, false},
+		// POST + flag on: all five are followed (FollowInfoRefsRedirect is
+		// the single opt-in #67 deliberately reuses rather than adding a
+		// second flag).
+		{"POST 301 flag on", http.MethodPost, http.StatusMovedPermanently, true, true},
+		{"POST 302 flag on", http.MethodPost, http.StatusFound, true, true},
+		{"POST 303 flag on", http.MethodPost, http.StatusSeeOther, true, true},
+		{"POST 307 flag on", http.MethodPost, http.StatusTemporaryRedirect, true, true},
+		{"POST 308 flag on", http.MethodPost, http.StatusPermanentRedirect, true, true},
+		// GET is untouched by this change: always followed regardless of
+		// the flag, for every code.
+		{"GET 301 flag off", http.MethodGet, http.StatusMovedPermanently, false, true},
+		{"GET 302 flag off", http.MethodGet, http.StatusFound, false, true},
+		{"GET 303 flag off", http.MethodGet, http.StatusSeeOther, false, true},
+		{"GET 307 flag off", http.MethodGet, http.StatusTemporaryRedirect, false, true},
+		{"GET 308 flag off", http.MethodGet, http.StatusPermanentRedirect, false, true},
+	}
 
-	ep, err := url.Parse(start.URL + "/repo.git")
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var finalHit bool
+			final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				finalHit = true
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer final.Close()
+			start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, final.URL+"/repo.git/git-upload-pack", tt.statusCode)
+			}))
+			defer start.Close()
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, start.URL+"/repo.git/git-upload-pack", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	res, err := conn.HTTP.Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
-	}
-	defer func() { _ = res.Body.Close() }()
+			ep, err := url.Parse(start.URL + "/repo.git")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
+			conn.FollowInfoRefsRedirect = tt.followFlag
 
-	if finalHit {
-		t.Error("POST redirect was followed with FollowInfoRefsRedirect unset")
-	}
-	if res.StatusCode != http.StatusTemporaryRedirect {
-		t.Errorf("status = %d, want the unfollowed 307 surfaced to the caller", res.StatusCode)
+			req, err := http.NewRequestWithContext(t.Context(), tt.method, start.URL+"/repo.git/git-upload-pack", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			res, err := conn.HTTP.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer func() { _ = res.Body.Close() }()
+
+			if finalHit != tt.expectFollowed {
+				t.Errorf("finalHit = %v, want %v", finalHit, tt.expectFollowed)
+			}
+			if tt.expectFollowed {
+				if res.StatusCode != http.StatusOK {
+					t.Errorf("status = %d, want 200 from the followed redirect", res.StatusCode)
+				}
+			} else if res.StatusCode != tt.statusCode {
+				t.Errorf("status = %d, want the unfollowed %d surfaced to the caller", res.StatusCode, tt.statusCode)
+			}
+		})
 	}
 }
 
-// The counterpart to TestGuardRedirectsRefusesPOSTRedirectByDefault: the same
-// POST redirect must still be followed when the user has opted in, since
-// FollowInfoRefsRedirect is the existing "follow redirects" setting and #67
-// deliberately reuses it rather than adding a second flag.
-func TestGuardRedirectsFollowsPOSTRedirectWithFollowInfoRefsRedirect(t *testing.T) {
-	var finalHit bool
-	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		finalHit = true
-		w.WriteHeader(http.StatusOK)
+// TestPostRPC_RefusedRedirectErrorNamesLocationAndFlags exercises the real
+// PostRPC -> httpError path (TestGuardRedirectsPostBehavior above calls
+// conn.HTTP.Do directly and never reaches httpError), so this is the only
+// test that would catch httpError's message regressing. PR #122 review:
+// the caller previously only got "http 307: <url>", with no indication a
+// redirect was involved or how to allow it.
+func TestPostRPC_RefusedRedirectErrorNamesLocationAndFlags(t *testing.T) {
+	const location = "https://replica.example/repo.git/git-upload-pack"
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		res := &http.Response{
+			StatusCode: http.StatusTemporaryRedirect,
+			Request:    req,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}
+		res.Header.Set("Location", location)
+		return res, nil
 	}))
-	defer final.Close()
-	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, final.URL+"/repo.git/git-upload-pack", http.StatusTemporaryRedirect)
-	}))
-	defer start.Close()
+	// FollowInfoRefsRedirect intentionally left off.
 
-	ep, err := url.Parse(start.URL + "/repo.git")
-	if err != nil {
-		t.Fatalf("parse: %v", err)
+	_, err := PostRPC(context.Background(), conn, "git-upload-pack", []byte("0000"), false, "phase")
+	if err == nil {
+		t.Fatal("expected an error from the refused redirect")
 	}
-	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
-	conn.FollowInfoRefsRedirect = true
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, start.URL+"/repo.git/git-upload-pack", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	if !strings.Contains(err.Error(), "307") {
+		t.Errorf("error must name the status code, got %q", err)
 	}
-	res, err := conn.HTTP.Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
+	if !strings.Contains(err.Error(), location) {
+		t.Errorf("error must name the Location the server redirected to, got %q", err)
 	}
-	defer func() { _ = res.Body.Close() }()
-
-	if !finalHit {
-		t.Error("POST redirect was not followed with FollowInfoRefsRedirect set")
-	}
-	if res.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 from the followed redirect", res.StatusCode)
-	}
-}
-
-// A GET (e.g. /info/refs) must keep following by default — only POST changed.
-func TestGuardRedirectsStillFollowsGETRedirectByDefault(t *testing.T) {
-	var finalHit bool
-	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		finalHit = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer final.Close()
-	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, final.URL+"/repo.git/info/refs", http.StatusTemporaryRedirect)
-	}))
-	defer start.Close()
-
-	ep, err := url.Parse(start.URL + "/repo.git")
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conn := NewHTTPConnWithClient(ep, "source", nil, start.Client())
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, start.URL+"/repo.git/info/refs", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	res, err := conn.HTTP.Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	if !finalHit {
-		t.Error("GET redirect was not followed by default")
-	}
-	if res.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 from the followed redirect", res.StatusCode)
+	if !strings.Contains(err.Error(), "--source-follow-info-refs-redirect") || !strings.Contains(err.Error(), "--target-follow-info-refs-redirect") {
+		t.Errorf("error must hint both flags that would allow the redirect, got %q", err)
 	}
 }
 
