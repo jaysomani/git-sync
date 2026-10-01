@@ -42,10 +42,10 @@ func httpError(res *http.Response) error {
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
-	// A 3xx here is guardRedirects refusing to follow a POST redirect with
-	// FollowInfoRefsRedirect unset (http.ErrUseLastResponse) — the only way
-	// a redirect status ever reaches this function, since Go's http.Client
-	// otherwise follows every redirect itself before returning. Location
+	// A 3xx here is typically guardRedirects refusing to follow a POST
+	// redirect with FollowInfoRefsRedirect unset (http.ErrUseLastResponse),
+	// since Go's http.Client otherwise follows every redirect itself before
+	// returning. Location
 	// names where the server tried to send the request, and the flag hint
 	// turns "why did my push get a 307" into an actionable answer instead
 	// of a bare status code.
@@ -260,9 +260,8 @@ type HTTPConn struct {
 	//     git's http.followRedirects=initial, which only auto-follows the
 	//     GET. When true, POST redirects are followed like GET ones.
 	//
-	// Off by default to preserve behaviour for callers that rely on
-	// EndpointURL being stable and on a POST redirect surfacing rather
-	// than silently following.
+	// Off by default: EndpointURL stays stable and POST redirects surface
+	// as errors instead of being followed silently.
 	FollowInfoRefsRedirect bool
 
 	// InsecureSkipTLSVerify mirrors the same-named transport setting and

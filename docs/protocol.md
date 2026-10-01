@@ -332,7 +332,7 @@ Some hosting providers respond to `/info/refs` with a 307 redirect to a differen
 
 `git-sync` exposes this as the `FollowInfoRefsRedirect` field on `gitproto.Conn`, and as the CLI flags `--source-follow-info-refs-redirect` and `--target-follow-info-refs-redirect`:
 
-- **Off (default)**: redirects are followed for the GET, but the subsequent RPC POSTs go to the original `Endpoint.Host`. This preserves stable behavior for callers that build URLs ahead of time.
+- **Off (default)**: redirects are followed for the GET, but the subsequent RPC POSTs go to the original `Endpoint.Host`. A POST redirect is refused and returned as an error instead of being followed. This preserves stable behavior for callers that build URLs ahead of time.
 - **On**: after `RequestInfoRefs` follows redirects, `Endpoint.Scheme` and `Endpoint.Host` are rewritten to the final URL's scheme and host. `Endpoint.Path` is never modified — it still contains the repo path.
 
 Library callers can set this via `gitsync.Endpoint{FollowInfoRefsRedirect: true}`.
